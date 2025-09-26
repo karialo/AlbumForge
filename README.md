@@ -25,7 +25,7 @@ It:
 - Generates static MP4s → `Video/` (with ffmpeg)  
 - Reports what’s missing with `status`  
 
-Think: *Downloads gremlin → tidy album wizard.* 🧙
+Think: *Downloads gremlin → tidy album wizard.* 
 
 ---
 
@@ -142,7 +142,7 @@ AlbumForge status --album NAME
 
 ## Why?  
 Because wrangling albums by hand is boring.  
-This script makes it fun, fast, and a little bit magical. 🪄  
+This script makes it fun, fast, and a little bit magical. 
 
 ---
 
