@@ -3,10 +3,14 @@
 # Single-file tool for album workflows:
 # - create/move/art/video/status/lyrics/preview + doctor (deps check/install)
 # - Inline modules: term_images, render, artmatch
+
 from __future__ import annotations
-import argparse, json, os, random, re, shutil, subprocess, sys, shlex, tempfile, base64
+import sys as _sys
+_sys.modules.setdefault("AlbumForge", _sys.modules[__name__])
+import argparse, json, os, random, re, shutil, subprocess, sys, shlex, tempfile, base64, time
 from pathlib import Path
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 
 APP = "albumforge"
 APP_TITLE = "AlbumForge"
@@ -21,54 +25,81 @@ _EMBED_TERM_IMAGES = r"""
 from __future__ import annotations
 import os, shutil, subprocess, base64, sys, os.path as op
 
-def have(cmd:str)->bool: return shutil.which(cmd) is not None
-def is_wezterm()->bool:
-    return os.environ.get("TERM_PROGRAM") == "WezTerm" or bool(os.environ.get("WEZTERM_EXECUTABLE") or os.environ.get("WT_SESSION"))
+def have(cmd:str)->bool: 
+    return shutil.which(cmd) is not None
 
-def preview(path:str)->bool:
-    '''
-    Try (in order): Kitty graphics, iTerm2/WezTerm OSC 1337, SIXEL, chafa, viu.
-    Returns True if *something* was shown.
-    '''
+def is_wezterm()->bool:
+    return os.environ.get("TERM_PROGRAM") == "WezTerm" or bool(
+        os.environ.get("WEZTERM_EXECUTABLE") or os.environ.get("WT_SESSION")
+    )
+
+def _term_wh() -> tuple[int, int]:
+    try:
+        sz = shutil.get_terminal_size((80, 24))
+        return sz.columns, sz.lines
+    except Exception:
+        return 80, 24
+
+def preview(path: str) -> bool:
+    # Try (in order): WezTerm imgcat, Kitty icat (auto-size), iTerm2/WezTerm OSC 1337, SIXEL, chafa, viu.
     path = op.abspath(path)
-    # 1) Kitty protocol (only renders if terminal supports it)
-    if have("kitty"):
+
+    # 0) WezTerm imgcat (most reliable on WezTerm)
+    if is_wezterm() and have("wezterm"):
         try:
-            subprocess.run(["kitty","+kitten","icat","--place","60x24@0x0",path], check=True)
+            subprocess.run(["wezterm", "imgcat", path], check=True, timeout=6)
             return True
         except Exception:
             pass
-    # 2) iTerm2/WezTerm OSC 1337
-    if is_wezterm():
+
+    # 1) Kitty icat — only if actually inside Kitty, auto-size to terminal
+    if have("kitty") and (os.environ.get("TERM", "").startswith("xterm-kitty")
+                          or os.environ.get("KITTY_INSTALLATION")):
         try:
-            with open(path,"rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            sys.stdout.write(f"\\033]1337;File=name={op.basename(path)};inline=1;size={len(b64)}:{b64}\\a\\n")
+            cols, rows = _term_wh()
+            subprocess.run(["kitty", "+kitten", "icat", "--place", f"{cols}x{rows}@0x0", path],
+                           check=True, timeout=6)
+            return True
+        except Exception:
+            pass
+
+    # 2) OSC 1337 (iTerm2 / WezTerm)
+    if is_wezterm() or os.environ.get("TERM_PROGRAM") in ("iTerm.app", "iTerm2"):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            b64 = base64.b64encode(raw).decode()
+            # size must be original byte length, not base64 length
+            sys.stdout.write(f"\033]1337;File=name={op.basename(path)};inline=1;size={len(raw)}:{b64}\a\n")
             sys.stdout.flush()
             return True
         except Exception:
             pass
+
     # 3) SIXEL
     if have("img2sixel"):
         try:
-            subprocess.run(["img2sixel", path], check=True)
+            subprocess.run(["img2sixel", path], check=True, timeout=6)
             return True
         except Exception:
             pass
-    # 4) Fallbacks — work everywhere
+
+    # 4) Fallbacks — text previews work everywhere
     if have("chafa"):
         subprocess.run(["chafa", path])
         return True
     if have("viu"):
         subprocess.run(["viu", path])
         return True
+
     return False
+
 """
 
 _EMBED_RENDER = r"""
 # render (embedded) — static video renderer (art + audio → mp4 in Video/)
 from __future__ import annotations
-import shutil, subprocess, re, json, os
+import shutil, subprocess, re, json, os, sys, time
 from pathlib import Path
 
 AUDIO_EXTS = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus"}
@@ -78,7 +109,7 @@ def have(cmd:str) -> bool:
     return shutil.which(cmd) is not None
 
 def _stem(p:Path) -> str:
-    return re.sub(r"\\.[^.]+$","",p.name)
+    return re.sub(r"\.[^.]+$","",p.name)
 
 def _ffprobe_duration(audio:Path) -> float:
     cmd = ["ffprobe","-v","error","-show_entries","format=duration","-of","json",str(audio)]
@@ -101,16 +132,14 @@ def _term_cols(default:int=80) -> int:
         return default
 
 def _shorten(text:str, maxlen:int) -> str:
-    if len(text) <= maxlen:
-        return text
-    if maxlen <= 1:
-        return text[:maxlen]
+    if len(text) <= maxlen: return text
+    if maxlen <= 1: return text[:maxlen]
     head = max(1, (maxlen - 1) // 2)
     tail = max(0, maxlen - head - 1)
-    return text[:head] + "…" + text[-tail:] if tail else text[:head] + "…"
+    return text[:head] + "…" + (text[-tail:] if tail else "")
 
 def _progress_line(title:str, audio:Path, out:Path, img:Path, ffmpeg_args:list[str], say=print) -> int:
-    '''Run ffmpeg with -progress pipe:1, render single-line adaptive bar.'''
+    # Run ffmpeg with -progress pipe:1, render single-line adaptive bar (TTY only).
     duration = _ffprobe_duration(audio)
     proc = subprocess.Popen(
         ["ffmpeg","-hide_banner","-loglevel","quiet","-y", *ffmpeg_args, "-progress","pipe:1", str(out)],
@@ -126,7 +155,8 @@ def _progress_line(title:str, audio:Path, out:Path, img:Path, ffmpeg_args:list[s
         except ValueError:
             tcur = 0.0
         pct  = (tcur/duration*100.0) if duration > 0 else 0.0
-        pct  = 0.0 if pct < 0 else (100.0 if pct > 100.0 else pct)
+        if   pct < 0:   pct = 0.0
+        elif pct > 100: pct = 100.0
         speed = last.get("speed","?")
 
         base_title = f"🎬 {title} "
@@ -139,15 +169,18 @@ def _progress_line(title:str, audio:Path, out:Path, img:Path, ffmpeg_args:list[s
         filled = int(round((pct/100.0)*barlen)) if barlen > 0 else 0
         bar = "[" + ("█"*filled + "░"*(barlen - filled)) + "]"
         line = f"{title_sh}{bar}{suffix}"
+
         if is_tty:
-            print("\\r" + line[:cols-1] + "\\x1b[K", end="", flush=True)
+            # REAL control chars: \r and ESC[K
+            sys.stdout.write("\r" + line[:cols-1] + "\x1b[K")
+            sys.stdout.flush()
         else:
             print(line[:cols-1], flush=True)
 
     try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line: 
                 continue
             if "=" in line:
                 k, v = line.split("=", 1)
@@ -157,25 +190,35 @@ def _progress_line(title:str, audio:Path, out:Path, img:Path, ffmpeg_args:list[s
         proc.wait()
     finally:
         if is_tty:
-            print()
+            print()  # finish the line
     return proc.returncode
 
 def run(album_root:Path, *, force:bool=False, say=print):
+    # tiny settle in case artwork just landed (FS race guards)
+    time.sleep(0.2)
+
     if not have("ffmpeg"):
         raise SystemExit("❌ ffmpeg not found in PATH.")
     audio_dir = album_root/"Audio"
     art_dir   = album_root/"Artwork"
     out_dir   = album_root/"Video"
     out_dir.mkdir(parents=True, exist_ok=True)
+
     audios = [p for p in audio_dir.glob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTS]
-    arts   = {_stem(p): p for p in art_dir.glob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS}
+    arts   = [p for p in art_dir.glob("*")   if p.is_file() and p.suffix.lower() in IMG_EXTS]
     if not audios:
         say("❌ No audio files found."); return 1
-    for a in sorted(audios):
-        stem = _stem(a)
-        img = arts.get(stem)
-        if not img:
-            say(f"⚠️  No artwork for {a.name}, skipping."); continue
+
+    A = { _stem(a): a for a in audios }
+    R = { _stem(i): i for i in arts }
+
+    common = sorted(set(A) & set(R))
+    missing_art = sorted(set(A) - set(R))
+    for s in missing_art:
+        say(f"⚠️  No artwork for {A[s].name}, skipping.")
+
+    for stem in common:
+        a = A[stem]; img = R[stem]
         out = out_dir / f"{stem}.mp4"
         if out.exists() and not force:
             say(f"⏭️  Exists, skipping: {out.name}"); continue
@@ -348,7 +391,44 @@ def say(x): print(x)
 def ok(x): print(f"\033[32m{x}\033[0m")
 def warn(x): print(f"\033[33m{x}\033[0m")
 def err(x): print(f"\033[31m{x}\033[0m", file=sys.stderr)
+def _sim(a:str, b:str) -> float:
+    a = re.sub(r"[^A-Za-z0-9]+", " ", a.lower()).strip()
+    b = re.sub(r"[^A-Za-z0-9]+", " ", b.lower()).strip()
+    return SequenceMatcher(None, a, b).ratio()
 
+def _pick_player() -> list[str] | None:
+    # prefer mpv, then vlc, then ffplay
+    if have("mpv"):   return ["mpv", "--no-video", "--audio-display=no"]
+    if have("vlc"):   return ["vlc", "--intf", "dummy", "--quiet"]
+    if have("ffplay"):return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error"]
+    return None
+
+def set_album_cover_from_image(album_root: Path, image: Path, *, ext:str="png", mode:str="copy"):
+    """Write album-root cover named after the folder: <AlbumName>.<ext>"""
+    dst = album_root / f"{album_root.name}.{ext}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "move":
+        shutil.move(str(image), str(dst))
+    else:
+        # convert/normalize extension if different? keep simple: just copy and rename
+        shutil.copy2(str(image), str(dst))
+    ok(f"Album cover set: {dst.name}")
+    return dst
+
+def detect_best_album_cover(src_dir: Path, album_name: str) -> Path | None:
+    """Heuristic: prefer filenames containing 'cover'/'front', else best title match."""
+    cand = [p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS]
+    if not cand: return None
+    pri = []
+    for p in cand:
+        name = p.stem.lower()
+        score = _sim(name, album_name)
+        if any(k in name for k in ("cover","front","folder")):
+            score += 0.25
+        pri.append((score, p))
+    pri.sort(reverse=True, key=lambda x: x[0])
+    return pri[0][1] if pri else None
+    
 def clear_screen():
     try:
         if os.name == "nt":
@@ -377,6 +457,100 @@ def have(cmd:str)->bool:
 
 def is_wezterm()->bool:
     return os.environ.get("TERM_PROGRAM") == "WezTerm" or bool(os.environ.get("WEZTERM_EXECUTABLE") or os.environ.get("WT_SESSION"))
+
+def manage_album_menu(cfg:dict):
+    def ask(prompt:str, default:str|None=None) -> str:
+        suffix = f" [{default}]" if default is not None else ""
+        resp = input(f"{prompt}{suffix}: ").strip()
+        return resp if resp else (default if default is not None else "")
+
+    def ask_yn(prompt:str, default:bool=False) -> bool:
+        d = "Y/n" if default else "y/N"
+        r = input(f"{prompt} ({d}): ").strip().lower()
+        return (r in ("y","yes")) if r else default
+
+    album = ask("Album (blank to pick recent)") or None
+    album_root = find_album_root(Path(cfg["music_root"]).expanduser(), album)
+    ensure_album_tree(album_root)
+
+    while True:
+        clear_screen()
+        a = len(list((album_root/"Audio").glob("*")))
+        l = len(list((album_root/"Lyrics").glob("*.txt")))
+        r = len(list((album_root/"Artwork").glob("*")))
+        v = len(list((album_root/"Video").glob("*.mp4")))
+        say(f"=== Manage: {album_root.name} ===")
+        say(f"A:{a} L:{l} R:{r} V:{v}")
+        say("\n1) Play album\n2) Show album cover\n3) Detect & set album cover\n4) Status\n5) Regenerate artwork\n6) Render videos\n7) Delete album (DANGEROUS)\nb) Back")
+        choice = input("> ").strip().lower()
+
+        if choice == "1":
+            player = _pick_player()
+            if not player: err("No supported player (mpv/vlc/ffplay) found."); input("Enter…"); continue
+            plist = sorted((album_root/"Audio").glob("*"))
+            if not plist: warn("No audio."); input("Enter…"); continue
+            try:
+                subprocess.call(player + [str(p) for p in plist])
+            except Exception as e:
+                err(f"Player failed: {e}")
+            continue
+
+        if choice == "2":
+            covers = [p for p in album_root.glob(f"{album_root.name}.*") if p.suffix.lower() in IMG_EXTS]
+            clear_screen()  # ensure preview has a clean canvas, esp. for chafa/viu
+            if covers:
+                if not ti.preview(str(covers[0])):
+                    warn("Preview failed. Install chafa or viu for text previews.")
+            else:
+                warn("No album cover found in album root.")
+            input("Enter…")
+            clear_screen()
+            continue
+
+
+        if choice == "3":
+            src = ask("Source folder for cover detection", str(Path(cfg["downloads_dir"]).expanduser()))
+            srcp = Path(src).expanduser()
+            if not srcp.exists(): err("No such folder."); input("Enter…"); continue
+            best = detect_best_album_cover(srcp, album_root.name)
+            if not best:
+                warn("No candidate images found."); input("Enter…"); continue
+            say(f"Best candidate: {best.name}")
+            if ask_yn("Use this as album cover?", True):
+                set_album_cover_from_image(album_root, best, ext=cfg.get("image_ext","png"), mode="copy")
+            input("Enter…"); continue
+
+        if choice == "4":
+            action_status(cfg, argparse.Namespace(album=album_root.name))
+            input("Enter…"); continue
+
+        if choice == "5":
+            src = ask("Source folder for artwork", str(Path(cfg["downloads_dir"]).expanduser()))
+            amode = ask("Artwork ingest mode (copy/move)", "copy").lower()
+            amode = amode if amode in ("copy","move") else "copy"
+            action_art(cfg, argparse.Namespace(album=album_root.name, src=src, mode=amode, dry_run=False, force=False))
+            input("Enter…"); continue
+
+        if choice == "6":
+            action_video(cfg, argparse.Namespace(album=album_root.name, force=False))
+            input("Enter…"); continue
+
+        if choice == "7":
+            warn("This will DELETE the entire album directory.")
+            say(f"Type DELETE {album_root.name} to confirm.")
+            if input("> ").strip() == f"DELETE {album_root.name}":
+                try:
+                    shutil.rmtree(album_root)
+                    ok("Album deleted.")
+                    return
+                except Exception as e:
+                    err(f"Failed: {e}")
+            else:
+                warn("Delete aborted.")
+            input("Enter…"); continue
+
+        if choice in ("b","q","back"): 
+            return
 
 # ----------
 # Doctor 💉
@@ -410,68 +584,236 @@ def _install_cmd(pm:str, pkgs:list[str]) -> list[str] | None:
         return ["brew","install",*pkgs]
     return None
 
-def doctor(interactive:bool=True) -> int:
+def doctor(interactive: bool = True) -> int:
+    import sys, glob, os
+
+    def _venv_active() -> bool:
+        return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+    def _externally_managed() -> bool:
+        # Heuristic for PEP 668 (Arch & friends): EXTERNALLY-MANAGED marker exists
+        paths = [
+            "/usr/lib/python*/EXTERNALLY-MANAGED",
+            "/usr/lib/python*/dist-packages/EXTERNALLY-MANAGED",
+            "/usr/lib/python*/site-packages/EXTERNALLY-MANAGED",
+        ]
+        for pat in paths:
+            if glob.glob(pat):
+                return True
+        return False
+
+    def _pip_install(pkgs: list[str], allow_break=False) -> int:
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if not _venv_active():
+            cmd.append("--user")
+            if allow_break:
+                cmd.append("--break-system-packages")
+        cmd += pkgs
+        say(" ".join(cmd))
+        try:
+            return subprocess.call(cmd)
+        except Exception as e:
+            err(f"pip install failed: {e}")
+            return 1
+
+    def _reexec_now():
+        ok("Reloading to pick up newly installed Python modules…")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def _create_local_venv_and_install(pkgs: list[str]) -> int:
+        vdir = Path.home() / ".config" / "albumforge" / ".venv"
+        vdir.parent.mkdir(parents=True, exist_ok=True)
+        ok(f"Creating venv at {vdir} …")
+        rc = subprocess.call([sys.executable, "-m", "venv", str(vdir)])
+        if rc != 0:
+            err(f"venv creation failed ({rc})"); return rc
+        py  = str(vdir / "bin" / "python")
+        say(f"{py} -m pip install {' '.join(pkgs)}")
+        rc = subprocess.call([py, "-m", "pip", "install", *pkgs])
+        if rc == 0:
+            ok("Installed into local venv.")
+            # optional: write a shim launcher if we are the monolith cli
+            launcher = Path.home() / ".local" / "bin" / "albumforge"
+            try:
+                launcher.parent.mkdir(parents=True, exist_ok=True)
+                body = f"""#!/usr/bin/env bash
+source "{vdir}/bin/activate"
+exec python -m AlbumForge "$@"
+"""
+                launcher.write_text(body)
+                launcher.chmod(0o755)
+                ok(f"Launcher written: {launcher} (uses local venv)")
+            except Exception:
+                pass
+            _reexec_now()
+        return rc
+
     ok("Doctor: scanning environment…")
-    missing = []
-    need = {
-        "ffmpeg": not have("ffmpeg"),
-        "tesseract": not have("tesseract"),
-        "chafa": not have("chafa"),
-        "viu": not have("viu"),
+
+    # ---------- system binaries ----------
+    core_bins = {"ffmpeg": not have("ffmpeg"), "tesseract": not have("tesseract")}
+    opt_bins  = {
+        "chafa": not have("chafa"), "viu": not have("viu"),
+        "kitty": not have("kitty"), "wezterm": not have("wezterm"),
+        "img2sixel": not have("img2sixel"), "mpv": not have("mpv"), "vlc": not have("vlc"),
     }
-    for k, v in need.items():
-        if v and k in ("ffmpeg","tesseract"):
-            missing.append(k)
 
-    if not missing:
-        ok("Core OK: ffmpeg & tesseract detected.")
+    missing_core_bins = [k for k, miss in core_bins.items() if miss]
+    if missing_core_bins: warn("Missing core tools: " + ", ".join(missing_core_bins))
+    else: ok("Core OK: ffmpeg & tesseract detected.")
+
+    missing_opt_bins = [k for k, miss in opt_bins.items() if miss]
+    if missing_opt_bins: warn("Optional tools missing (previews/players): " + ", ".join(missing_opt_bins))
+    else: ok("Optional tools present (nice!).")
+
+    # ---------- python modules ----------
+    py_wants = ["PIL"]  # Pillow is 'PIL'
+    missing_py = []
+    for mod in py_wants:
+        try: __import__(mod)
+        except Exception:
+            missing_py.append("pillow" if mod == "PIL" else mod)
+
+    if missing_py:
+        warn("Missing Python modules: " + ", ".join(sorted(set(missing_py))))
     else:
-        warn("Missing core tools: " + ", ".join(missing))
+        ok("Python modules OK (textual, rich, pillow).")
 
-    opt_missing = [k for k in ("chafa","viu") if need[k]]
-    if opt_missing:
-        warn("Optional tools missing (for nicer previews): " + ", ".join(opt_missing))
-    else:
-        ok("Optional preview tools present.")
+    if not interactive:
+        return 0 if not (missing_core_bins or missing_py) else 1
 
-    if interactive and missing:
+    # ---------- install core system deps ----------
+    if missing_core_bins:
         pm = _detect_pkgmgr()
         if not pm:
             warn("No known package manager detected (pacman/apt/dnf/zypper/apk/brew).")
-            return 1
-        pkgs = []
-        for m in missing:
-            alias = PKG_ALIASES.get(m, {})
-            pkgs.append(alias.get(pm, m))
-        say(f"\nDetected package manager: {pm}")
-        say("I can install: " + " ".join(pkgs))
-        yn = input("Proceed with install? (y/N): ").strip().lower()
-        if yn not in ("y","yes"):
-            warn("Skipped installation.")
-            return 1
-        cmd = _install_cmd(pm, pkgs)
-        if not cmd:
-            warn("Unsupported installer on this system.")
-            return 1
-        try:
-            if pm == "apt":
-                shell_cmd = " ".join(cmd)
-                rc = subprocess.call(shell_cmd, shell=True)
+        else:
+            pkgs = []
+            for m in missing_core_bins:
+                alias = PKG_ALIASES.get(m, {})
+                pkgs.append(alias.get(pm, m))
+            say(f"\nDetected package manager: {pm}")
+            say("I can install: " + " ".join(pkgs))
+            if input("Proceed with system install? (y/N): ").strip().lower() in ("y","yes"):
+                cmd = _install_cmd(pm, pkgs)
+                if not cmd: warn("Unsupported installer on this system."); return 1
+                try:
+                    rc = subprocess.call(" ".join(cmd), shell=True) if pm == "apt" else subprocess.call(cmd)
+                    if rc == 0: ok("System install complete.")
+                    else: err(f"Installer returned {rc}."); return rc
+                except Exception as e:
+                    err(f"Install failed: {e}"); return 1
             else:
-                rc = subprocess.call(cmd)
-            if rc == 0:
-                ok("Install complete. Re-run doctor if needed.")
+                warn("Skipped system package installation.")
+
+    # ---------- install Python deps (PEP668-aware) ----------
+    if missing_py:
+        say("\nPython environment:")
+        say(f"  Interpreter : {sys.executable}")
+        say(f"  Venv active : {'yes' if _venv_active() else 'no'}")
+        say(f"  Prefix      : {sys.prefix}")
+        say(f"  BasePrefix  : {getattr(sys, 'base_prefix', sys.prefix)}")
+        pep668 = _externally_managed()
+        if pep668 and not _venv_active():
+            warn("This Python is externally managed (PEP 668).")
+            pm = _detect_pkgmgr()
+            if pm == "pacman":
+                # Arch names for libs
+                pac_pkgs = []
+                for p in sorted(set(missing_py)):
+                    if p == "pillow": pac_pkgs.append("python-pillow")
+                    elif p == "rich": pac_pkgs.append("python-rich")
+                    elif p == "textual": pac_pkgs.append("python-textual")
+                say("Option A) Install via pacman: " + " ".join(pac_pkgs))
+                say("Option B) Create a local venv just for AlbumForge (recommended).")
+                say("Option C) Force pip with --break-system-packages (not recommended).")
+                choice = input("Choose [A/B/C/N]: ").strip().lower()
+                if choice == "a":
+                    cmd = _install_cmd(pm, pac_pkgs)
+                    rc = subprocess.call(cmd)
+                    if rc == 0:
+                        # fresh modules available system-wide; reload to import now
+                        _reexec_now()
+                    return rc
+                elif choice == "b":
+                    rc = _create_local_venv_and_install(sorted(set(missing_py)))
+                    return rc
+                elif choice == "c":
+                    rc = _pip_install(sorted(set(missing_py)), allow_break=True)
+                    if rc == 0: _reexec_now()
+                    return rc
+                else:
+                    warn("Skipped Python module installation.")
+                    return 1
             else:
-                err(f"Installer returned {rc}.")
+                # Non-pacman externally-managed env: strongly prefer local venv
+                say("Option A) Create a local venv (recommended).")
+                say("Option B) Force pip with --break-system-packages.")
+                choice = input("Choose [A/B/N]: ").strip().lower()
+                if choice == "a":
+                    rc = _create_local_venv_and_install(sorted(set(missing_py)))
+                    return rc
+                elif choice == "b":
+                    rc = _pip_install(sorted(set(missing_py)), allow_break=True)
+                    if rc == 0: _reexec_now()
+                    return rc
+                else:
+                    warn("Skipped Python module installation.")
+                    return 1
+        else:
+            # venv active or not externally-managed: normal pip install
+            pkgs = sorted(set(missing_py))
+            say("I can install Python modules: " + " ".join(pkgs))
+            if input("Install into this environment with pip? (y/N): ").strip().lower() in ("y","yes"):
+                rc = _pip_install(pkgs, allow_break=False)
+                if rc == 0:
+                    ok("Python module install complete.")
+                    _reexec_now()
+                else:
+                    err(f"pip exited with {rc}.")
                 return rc
-        except Exception as e:
-            err(f"Install failed: {e}")
-            return 1
+            else:
+                warn("Skipped Python module installation.")
+                return 1
+
+    # ---------- summary ----------
+    ok("Doctor finished: all green.")
     return 0
+
 
 # -----------------------
 # Core helpers & actions
 # -----------------------
+def _plan_audio_ingest(album_root: Path, src_files: list[Path], state: dict) -> list[tuple[Path, Path, str, str]]:
+    """
+    Return planned (src, dst, NN, Title) using the same seeded shuffle/numbering
+    as the real ingest, but without writing anything.
+    """
+    audio_dir = album_root / "Audio"
+    existing_audios = sorted([p for p in audio_dir.iterdir()
+                              if p.is_file() and p.suffix.lower() in AUDIO_EXTS])
+    existing_nn = [re.match(r"^\s*(\d{2})\s*-\s*", p.name).group(1)
+                   for p in existing_audios if re.match(r"^\s*(\d{2})\s*-\s*", p.name)]
+    existing_nn += [t.get("n","") for t in state.get("tracks", [])]
+
+    nums_needed = next_free_numbers(existing_nn, len(src_files))
+
+    # lock shuffle to existing seed so preview == actual
+    seed = state.get("seed")
+    if not seed:
+        seed = random.randint(100000, 999999)
+    rnd = random.Random(seed)
+    files = list(src_files)
+    rnd.shuffle(files)
+
+    plan = []
+    for idx, src in enumerate(files):
+        nn = nums_needed[idx]
+        title = sanitize_title(src.name)
+        dst = (audio_dir / f"{nn} - {title}{src.suffix.lower()}")
+        plan.append((src, dst, nn, title))
+    return plan
+
 def find_album_root(music_root:Path, album:str|None)->Path:
     if album:
         return (music_root/album).resolve()
@@ -525,54 +867,137 @@ def list_images_in_dir(path: Path) -> list[Path]:
     return sorted([p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
 
 def action_create(cfg:dict, args):
+    """
+    Create/ensure the album tree. If --populate is set:
+      • Build a DRY plan for audio (exact NN - Title destinations) using a persisted seed
+      • Run OCR to predict artwork matches WITHOUT moving files
+      • Show a full summary (audio plan, artwork predictions, lyric/video estimates)
+      • On YES, perform audio ingest, artwork ingest, lyrics, and (if art exists) render videos
+    """
     music_root = Path(cfg["music_root"]).expanduser()
     music_root.mkdir(parents=True, exist_ok=True)
-    target = music_root/args.name
+    target = music_root / args.name
     if target.exists():
         say(f"Album exists: {target}")
     else:
         ensure_album_tree(target)
         ok(f"Created album: {target}")
+
+    # Load state and ensure it exists on disk
     state = load_state(target)
     save_state(target, state)
 
-    if getattr(args, "populate", False):
-        src = Path(getattr(args, "src", "") or cfg["downloads_dir"]).expanduser()
-        aud = list_audio_in_dir(src, cfg.get("freshness_minutes", 0))
-        imgs = list_images_in_dir(src)
-        mode = getattr(args, "mode", "copy")
-        say("\n" + "="*72)
-        warn(" ⚠️  AUTO-POPULATE IS ABOUT TO RUN ")
-        say(f" Source folder : {src}")
-        say(f" Audio files   : {len(aud)}")
-        say(f" Image files   : {len(imgs)} (used by 'art')")
-        say(f" Mode          : {mode.upper()} (audio ingest)")
-        say("="*72 + "\n")
-        if not getattr(args, "yes", False):
-            say("MAKE SURE YOU HAVE ALL SONGS AND ARTWORK IN THE SOURCE FOLDER.")
-            say("Type YES (all caps) to continue, anything else to abort.")
-            if input("> ").strip() != "YES":
-                warn("Aborted by user. Album created, nothing ingested.")
-                return
-        action_move(cfg, argparse.Namespace(
-            album=args.name, src=str(src),
-            dry_run=getattr(args, "dry_run", False),
-            force=getattr(args, "force", False),
-            mode=mode
-        ))
-        art_mode = getattr(args, "art_mode", "copy")
-        action_art(cfg, argparse.Namespace(
-            album=args.name, src=str(src),
-            mode=art_mode,
-            dry_run=getattr(args, "dry_run", False),
-            force=getattr(args, "force", False)
-        ))
-        action_make_lyrics(cfg, argparse.Namespace(album=args.name))
-        album_root = find_album_root(Path(cfg["music_root"]).expanduser(), args.name)
-        has_art = any((album_root/"Artwork").glob("*"))
-        if has_art:
-            action_video(cfg, argparse.Namespace(album=args.name, force=False))
-        action_status(cfg, argparse.Namespace(album=args.name))
+    # Simple create (no auto-populate)
+    if not getattr(args, "populate", False):
+        return
+
+    # ------- Gather sources -------
+    src = Path(getattr(args, "src", "") or cfg["downloads_dir"]).expanduser()
+    aud_src = list_audio_in_dir(src, cfg.get("freshness_minutes", 0))
+    img_src = list_images_in_dir(src)
+    mode = getattr(args, "mode", "copy")
+    art_mode = getattr(args, "art_mode", "copy")
+
+    # ------- Build detailed plans (no side effects) -------
+    # Ensure deterministic shuffle: persist seed BEFORE planning so preview == ingest
+    if not state.get("seed"):
+        state["seed"] = random.randint(100000, 999999)
+        save_state(target, state)
+
+    # Audio plan (exact NN - Title destinations)
+    plan_audio = _plan_audio_ingest(target, aud_src, dict(state)) if aud_src else []
+
+    # Prospective tracks = existing + planned (avoid NN duplicates, prefer existing)
+    tracks_existing = [(t["n"], t["title"]) for t in state.get("tracks", [])]
+    tracks_planned  = [(nn, title) for (_s, _d, nn, title) in plan_audio]
+    seen = {nn for nn, _ in tracks_existing}
+    prospective_tracks = tracks_existing + [(nn, t) for nn, t in tracks_planned if nn not in seen]
+
+    # Artwork match preview via OCR (wet scan), NO file moves
+    art_pairs = []
+    if img_src and prospective_tracks:
+        titles = [t for _, t in prospective_tracks]
+        art_pairs, _ = am.plan_matches(
+            img_src, titles,
+            lang=cfg.get("ocr_lang","eng"),
+            psm=cfg.get("ocr_psm","6")
+        )
+
+    # Estimated lyric files to create
+    lyrics_dir = target / "Lyrics"
+    est_new_lyrics = 0
+    for (_s, _d, nn, title) in plan_audio:
+        if not (lyrics_dir / f"{nn} - {title}.txt").exists():
+            est_new_lyrics += 1
+
+    # Estimated videos (predicted artwork matches)
+    est_video = len(art_pairs)
+
+    # ------- Present the plan BEFORE confirmation -------
+    say("\n" + "="*72)
+    warn(" ⚠️  AUTO-POPULATE IS ABOUT TO RUN ")
+    say(f" Source folder : {src}")
+    say(f" Audio files   : {len(aud_src)}")
+    say(f" Image files   : {len(img_src)} (used by 'art')")
+    say(f" Mode          : {mode.upper()} (audio ingest)")
+    say("="*72 + "\n")
+
+    # Audio plan table
+    if plan_audio:
+        say("Audio ingest plan:")
+        for srcp, dstp, nn, title in plan_audio:
+            say(f"  {srcp.name}  ->  {dstp.relative_to(target)}  [{mode}]")
+    else:
+        say("Audio ingest plan: (no audio candidates found)")
+
+    # Artwork plan table (predicted)
+    if art_pairs:
+        say("\nArtwork match plan (prediction):")
+        # art_pairs indices map to 'titles' from prospective_tracks
+        for i, j, sc in art_pairs:
+            nn, title = prospective_tracks[j]
+            dst = (target / "Artwork") / f"{nn} - {title}.{cfg.get('image_ext','png')}"
+            say(f"  {img_src[i].name}  ->  {dst.relative_to(target)}  [score {sc:.2f}]")
+    else:
+        say("\nArtwork match plan: (no images or no tracks yet)")
+
+    say(f"\nEstimated new lyrics files: {est_new_lyrics}")
+    say(f"Estimated videos to render: {est_video}")
+
+    say("\nMAKE SURE YOU HAVE ALL SONGS AND ARTWORK IN THE SOURCE FOLDER.")
+    say("Type YES (all caps) to continue, anything else to abort.")
+    if not getattr(args, "yes", False):
+        if input("> ").strip() != "YES":
+            warn("Aborted by user. Album created, nothing ingested.")
+            return
+
+    # ------- Execute actual ingest -------
+    action_move(cfg, argparse.Namespace(
+        album=args.name, src=str(src),
+        dry_run=False, force=getattr(args, "force", False),
+        mode=mode
+    ))
+    action_art(cfg, argparse.Namespace(
+        album=args.name, src=str(src),
+        mode=art_mode, dry_run=False,
+        force=getattr(args, "force", False)
+    ))
+    
+    # Try to set album cover from the same source, if not already present
+    root_cover = list((target).glob(f"{target.name}.*"))
+    if not root_cover:
+        best = detect_best_album_cover(Path(getattr(args,"src", "") or cfg["downloads_dir"]).expanduser(),target.name)
+        if best:
+            set_album_cover_from_image(target, best, ext=cfg.get("image_ext","png"), mode="copy")
+
+    
+    action_make_lyrics(cfg, argparse.Namespace(album=args.name))
+
+    # Render if any art now exists
+    if any((target / "Artwork").glob("*")):
+        action_video(cfg, argparse.Namespace(album=args.name, force=False))
+
+    action_status(cfg, argparse.Namespace(album=args.name))
 
 def action_move(cfg:dict, args):
     album_root = find_album_root(Path(cfg["music_root"]).expanduser(), args.album)
@@ -689,6 +1114,20 @@ def action_art(cfg:dict, args):
 def action_video(cfg:dict, args):
     album_root = find_album_root(Path(cfg["music_root"]).expanduser(), args.album)
     ensure_album_tree(album_root)
+
+    # tiny settle to avoid FS race when we just wrote Artwork/
+    time.sleep(0.2)
+
+    # If artwork is present, run renderer; otherwise bail cleanly
+    audio = list((album_root/"Audio").glob("*"))
+    art   = list((album_root/"Artwork").glob("*"))
+    if not audio:
+        warn("No audio to render."); return
+    if not art:
+        warn("No artwork found; skipping video render."); return
+
+    # Let renderer filter pairs; it already checks stems,
+    # but we call it only if both dirs have content.
     rv.run(album_root, force=getattr(args, "force", False), say=say)
 
 def action_status(cfg:dict, args):
@@ -788,7 +1227,7 @@ def run_menu(cfg:dict):
         albums = sorted([p for p in music_root.iterdir()
                          if p.is_dir() and p.name != ".git" and not p.name.startswith(".")])
 
-        say(f"=== {APP_TITLE} ===")
+        say("=== AlbumForge ===")
         say(f"music_root: {music_root}")
         say("Albums:")
         for p in albums[:12]:
@@ -799,8 +1238,24 @@ def run_menu(cfg:dict):
             total = max(a, l, r, v, 1)
             pct = int(round(100 * min(a, l, r, v) / total))
             say(f"  - {p.name:32s}  A:{a:2d} L:{l:2d} R:{r:2d} V:{v:2d}  ({pct:3d}%)")
-        say("\n1) Create album\n2) Move music\n3) Generate artwork\n4) Generate videos\n5) Status\n6) Preview artwork\n7) Doctor (check/install deps)\nq) Quit")
+        say("\n1) Create album\n2) Manage album\n3) Preview artwork\n7) Doctor (check/install deps)\nq) Quit")
         choice = input("> ").strip().lower()
+
+        if choice == "1":
+            # (your existing create flow unchanged)
+            ...
+        elif choice == "2":
+            manage_album_menu(cfg); continue
+        elif choice == "3":
+            album = None
+            # reuse your existing preview_artwork flow
+            action_preview_artwork(cfg, argparse.Namespace(album=album))
+            pause_then_clear(); continue
+        elif choice == "7":
+            doctor(True); pause_then_clear(); continue
+        elif choice in ("q","quit","exit"):
+            return
+
 
         if choice == "1":
             name = ask("Album name")
@@ -890,10 +1345,17 @@ def run_menu(cfg:dict):
 # -------
 def main():
     cfg = load_config()
-    ap = argparse.ArgumentParser(prog=APP, description=f"{APP_TITLE} — single-file album workflow orchestrator")
-    ap.add_argument("-V","--version", action="store_true", help="Print version and exit")
-    ap.add_argument("--menu", action="store_true", help="Open interactive menu")
 
+    # build parser (let argparse resolve duplicates just in case)
+    ap = argparse.ArgumentParser(
+        prog=APP,
+        description=f"{APP_TITLE} — single-file album workflow orchestrator",
+        conflict_handler="resolve",
+    )
+    ap.add_argument("-V", "--version", action="store_true", help="Print version and exit")
+    ap.add_argument("--menu", action="store_true", help="Open interactive menu")
+    
+    # subcommands
     sub = ap.add_subparsers(dest="cmd")
 
     sp = sub.add_parser("doctor", help="Check environment and offer to install missing deps")
@@ -904,7 +1366,7 @@ def main():
     sp.add_argument("--src", help="Source folder for ingest (default: config downloads_dir)")
     sp.add_argument("--mode", choices=("copy","move"), default="copy", help="How to ingest audio during --populate (default: copy)")
     sp.add_argument("--art-mode", choices=("copy","move"), dest="art_mode", default="copy", help="How to ingest artwork during --populate (default: copy)")
-    sp.add_argument("--yes", action="store_true", help='Skip confirmation (DANGEROUS). Implies you read the warning.')
+    sp.add_argument("--yes", action="store_true", help="Skip confirmation (DANGEROUS). Implies you read the warning.")
     sp.add_argument("--dry-run", action="store_true", help="Plan only; do not change files")
     sp.add_argument("--force", action="store_true", help="Overwrite existing numbered targets where applicable")
 
@@ -935,20 +1397,26 @@ def main():
     sp = sub.add_parser("preview", help="Preview an image (inline if supported; fallback to chafa/viu)")
     sp.add_argument("image", help="Path to an image (png/jpg/webp)")
 
+    # ---- parse once everything is declared ----
     args = ap.parse_args()
-    if args.version:
-        print(f"{APP_TITLE} v{VERSION}"); return
-    if args.menu or not args.cmd:
-        run_menu(cfg); return
 
-    if args.cmd == "doctor":    doctor(True)
-    elif args.cmd == "create":  action_create(cfg, args)
-    elif args.cmd == "move":    action_move(cfg, args)
-    elif args.cmd == "art":     action_art(cfg, args)
-    elif args.cmd == "video":   action_video(cfg, args)
-    elif args.cmd == "status":  action_status(cfg, args)
-    elif args.cmd == "lyrics":  action_make_lyrics(cfg, args)
-    elif args.cmd == "preview": action_preview(cfg, args)
+    if args.version:
+        print(f"{APP_TITLE} v{VERSION}")
+        return
+
+    if args.menu or not args.cmd:
+        run_menu(cfg)
+        return
+
+    # dispatch
+    if args.cmd == "doctor":        doctor(True)
+    elif args.cmd == "create":      action_create(cfg, args)
+    elif args.cmd == "move":        action_move(cfg, args)
+    elif args.cmd == "art":         action_art(cfg, args)
+    elif args.cmd == "video":       action_video(cfg, args)
+    elif args.cmd == "status":      action_status(cfg, args)
+    elif args.cmd == "lyrics":      action_make_lyrics(cfg, args)
+    elif args.cmd == "preview":     action_preview(cfg, args)
     else:
         ap.print_help()
 
