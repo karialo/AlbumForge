@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# AlbumForge — Monolith v0.6.0
 # Single-file tool for album workflows:
 # - create/move/art/video/status/lyrics/preview + doctor (deps check/install)
 # - Inline modules: term_images, render, artmatch
@@ -239,88 +238,222 @@ def run(album_root:Path, *, force:bool=False, say=print):
     return 0
 """
 
-_EMBED_ARTMATCH = r"""
-# artmatch (embedded) — OCR + fuzzy best-fit image→track
+_EMBED_ARTMATCH = r'''
+# artmatch (embedded) — deterministic, optimal image→track mapping
+# Truth order: (A) leading NN lock, (B) global optimal filename match (Hungarian),
+# (C) OCR fallback (opt-in). If strict=True, anything low-confidence goes to _UNMATCHED/.
 from __future__ import annotations
-import re, shutil, subprocess
+import re, shutil, subprocess, math
 from pathlib import Path
 from difflib import SequenceMatcher
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+NUM_RX   = re.compile(r'^\s*(\d{1,2})\s*[-._ ]\s*', re.U)
 
-def have(cmd:str)->bool: return shutil.which(cmd) is not None
+def have(cmd:str)->bool: 
+    return shutil.which(cmd) is not None
 
-def _norm(s:str)->str:
+# ---------- normalization ----------
+def _slug(s:str)->str:
     s = s.lower()
-    s = re.sub(r"[^\\w\\s]", " ", s)
-    s = re.sub(r"\\s+", " ", s).strip()
+    s = re.sub(r'\(feat[^)]*\)', '', s)
+    s = s.replace('&', ' and ')
+    s = re.sub(r'[_\.\-]+', ' ', s)
+    s = re.sub(r'[^a-z0-9 ]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    # common canon
+    s = s.replace(' over clock ', ' overclock ')
+    s = s.replace(' 404 ', ' four oh four ')
+    s = s.replace(' consume exe', ' consume exe')
     return s
 
-def _sim(a:str,b:str)->float:
-    A, B = set(_norm(a).split()), set(_norm(b).split())
-    token = 2*len(A&B)/(len(A)+len(B)) if A and B else 0.0
-    ratio = SequenceMatcher(None, _norm(a), _norm(b)).ratio()
-    return 0.6*ratio + 0.4*token
+def _num(name:str) -> int | None:
+    m = NUM_RX.match(name)      # only accept at START, 1–2 digits
+    if not m: return None
+    n = int(m.group(1))
+    return n if 1 <= n <= 99 else None
 
-def _ocr_text(img:Path, lang:str, psm:str|None, timeout:int=8)->str:
+def _title_from_filename(p:Path) -> str:
+    return NUM_RX.sub('', p.stem)
+
+def _sim(a:str, b:str) -> float:
+    return SequenceMatcher(None, _slug(a), _slug(b)).ratio()
+
+# ---------- OCR (optional fallback) ----------
+def _ocr_text(img:Path, lang:str, psm:str|None, timeout:int=8) -> str:
     if not have("tesseract"): return ""
     cmd = ["tesseract", str(img), "stdout", "-l", lang]
     if psm: cmd += ["--psm", psm]
     try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout).strip()
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
+        out = re.sub(r'[^A-Za-z0-9 ._\-]', ' ', out)
+        out = re.sub(r'\s+', ' ', out).strip()
+        return out
     except Exception:
         return ""
 
-def plan_matches(images:list[Path], tracks:list[str], lang:str="eng", psm:str|None="6"):
-    scores = []
-    for img in images:
-        combo = img.stem
-        txt = _ocr_text(img, lang, psm)
-        if txt: combo = f"{txt} {combo}"
-        row = [_sim(combo, t) for t in tracks]
-        scores.append(row)
-    assigned = []
-    used_t = set()
-    for i, row in enumerate(scores):
-        best_j, best_sc = None, -1.0
-        for j, sc in enumerate(row):
-            if j in used_t: continue
-            if sc > best_sc:
-                best_j, best_sc = j, sc
-        if best_j is not None:
-            assigned.append((i, best_j, best_sc))
-            used_t.add(best_j)
-    assigned.sort(key=lambda x: x[1])
-    return assigned, scores
+# ---------- Hungarian (maximize) ----------
+def _hungarian_max(cost: list[list[float]]) -> list[tuple[int,int]]:
+    """Return list of (i,j) maximizing total cost; rectangular OK (pads with 0)."""
+    n = max(len(cost), max((len(r) for r in cost), default=0))
+    M = [[0.0]*n for _ in range(n)]
+    mx = 0.0
+    for i,row in enumerate(cost):
+        for j,v in enumerate(row):
+            M[i][j] = v
+            if v > mx: mx = v
+    W = [[mx - M[i][j] for j in range(n)] for i in range(n)]
 
-def run(album_root:Path, src_dir:Path, tracks:list[tuple[str,str]], *,  # (NN, Title)
+    u = [0.0]*(n+1); v = [0.0]*(n+1); p = [0]*(n+1); way = [0]*(n+1)
+    for i in range(1, n+1):
+        p[0] = i; j0 = 0
+        minv = [math.inf]*(n+1); used = [False]*(n+1)
+        while True:
+            used[j0] = True; i0 = p[j0]; delta = math.inf; j1 = 0
+            for j in range(1, n+1):
+                if used[j]: continue
+                cur = W[i0-1][j-1] - u[i0] - v[j]
+                if cur < minv[j]: minv[j] = cur; way[j] = j0
+                if minv[j] < delta: delta = minv[j]; j1 = j
+            for j in range(0, n+1):
+                if used[j]: u[p[j]] += delta; v[j] -= delta
+                else:       minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0: break
+        while True:
+            j1 = way[j0]; p[j0] = p[j1]; j0 = j1
+            if j0 == 0: break
+    match = []
+    for j in range(1, n+1):
+        i = p[j]
+        if i and i-1 < len(cost) and j-1 < len(cost[i-1]):
+            match.append((i-1, j-1))
+    return match
+
+# ---------- Planner ----------
+def plan_matches(images:list[Path], tracks:list[str], *, lang:str="eng", psm:str|None="6", use_ocr:bool=False,
+                 filename_thresh:float=0.82):
+    """
+    Return:
+      pairs: list of (img_idx, track_idx, score, method)  — accepted matches only
+      leftover_images: indices not confidently matched
+    """
+    # A) number lock
+    locked = []
+    used_i, used_j = set(), set()
+    track_nums = []
+    for t in tracks:
+        m = NUM_RX.match(t); track_nums.append(int(m.group(1)) if m else None)
+
+    for i, img in enumerate(images):
+        ni = _num(img.stem)
+        if ni is None: continue
+        for j, nj in enumerate(track_nums):
+            if j in used_j: continue
+            if nj == ni:
+                locked.append((i,j,1.0,"number"))
+                used_i.add(i); used_j.add(j)
+                break
+
+    # B) global optimal filename matching
+    rem_i = [i for i in range(len(images)) if i not in used_i]
+    rem_j = [j for j in range(len(tracks)) if j not in used_j]
+    if rem_i and rem_j:
+        cost = []
+        for i in rem_i:
+            ti = _title_from_filename(images[i])
+            row = []
+            for j in rem_j:
+                tj = NUM_RX.sub('', tracks[j])
+                row.append(_sim(ti, tj))
+            cost.append(row)
+        assign = _hungarian_max(cost)
+        for a_i, a_j in assign:
+            i = rem_i[a_i]; j = rem_j[a_j]; sc = cost[a_i][a_j]
+            if sc >= filename_thresh:
+                locked.append((i,j,sc,"filename"))
+                used_i.add(i); used_j.add(j)
+
+    # C) optional OCR fallback (greedy but only on leftovers)
+    if use_ocr:
+        rem_i = [i for i in range(len(images)) if i not in used_i]
+        rem_j = [j for j in range(len(tracks)) if j not in used_j]
+        if rem_i and rem_j:
+            for i in rem_i:
+                txt = _ocr_text(images[i], lang=lang, psm=psm) or _title_from_filename(images[i])
+                best_j, best_sc = None, -1.0
+                for j in rem_j:
+                    sc = _sim(txt, NUM_RX.sub('', tracks[j]))
+                    if sc > best_sc: best_j, best_sc = j, sc
+                if best_j is not None:
+                    locked.append((i,best_j,best_sc,"ocr"))
+                    used_i.add(i); used_j.add(best_j)
+
+    locked.sort(key=lambda x: x[1])
+    leftover_images = [i for i in range(len(images)) if i not in used_i]
+    return locked, leftover_images
+
+# ---------- Runner ----------
+def run(album_root:Path, src_dir:Path, tracks:list[tuple[str,str]], *,
         out_ext:str="png", lang:str="eng", psm:str|None="6",
-        dry_run:bool=False, force:bool=False, say=print):
+        dry_run:bool=False, force:bool=False, say=print, ocr:bool=False, strict:bool=True,
+        filename_thresh:float=0.82):
     out_dir = album_root/"Artwork"
     out_dir.mkdir(parents=True, exist_ok=True)
     images = sorted([p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
     if not images:
         say("❌ No images found in source directory."); return 1
-    track_titles = [title for _, title in tracks]
-    pairs, _ = plan_matches(images, track_titles, lang=lang, psm=psm)
-    say("Plan:")
-    for i, j, sc in pairs:
+
+    labels = [f"{nn} - {title}" for nn, title in tracks]
+    pairs, leftovers = plan_matches(images, labels, lang=lang, psm=psm, use_ocr=ocr, filename_thresh=filename_thresh)
+
+    say("Artwork pairing plan:")
+    for i, j, sc, method in pairs:
         nn, title = tracks[j]
         dst = out_dir / f"{nn} - {title}.{out_ext}"
-        say(f"  {images[i].name}  →  {dst.relative_to(album_root)}  [score {sc:.2f}]")
+        say(f"  {images[i].name}  →  {dst.relative_to(album_root)}  [{method}  score={sc:.2f}]")
+
+    if leftovers:
+        say("\nUnmatched (kept original name):")
+        for i in leftovers:
+            say(f"  {images[i].name}  →  Artwork/_UNMATCHED/{images[i].name}")
+
     if dry_run:
-        say("DRY-RUN: no files moved.")
-        return 0
-    for i, j, sc in pairs:
+        say("DRY-RUN: no files moved."); return 0
+
+    # Apply accepted matches
+    used_dst = set()
+    for i, j, sc, method in pairs:
         nn, title = tracks[j]
+        src = images[i]
         dst = out_dir / f"{nn} - {title}.{out_ext}"
+        if dst in used_dst:
+            say(f"⏭️  Skipping duplicate target: {dst.name}"); 
+            continue
+        used_dst.add(dst)
         if dst.exists() and not force:
-            say(f"⏭️  Exists: {dst.name}"); continue
+            say(f"⏭️  Exists: {dst.name}"); 
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(images[i]), str(dst))
-        say(f"✓ {images[i].name} → {dst.relative_to(album_root)}")
+        try: shutil.move(str(src), str(dst))
+        except Exception: shutil.copy2(str(src), str(dst))
+        say(f"✓ {src.name} → {dst.relative_to(album_root)}")
+
+    # Park leftovers safely (strict mode)
+    if leftovers:
+        park = out_dir / "_UNMATCHED"
+        park.mkdir(parents=True, exist_ok=True)
+        for i in leftovers:
+            src = images[i]
+            dst = park / src.name
+            if dst.exists() and not force:
+                say(f"⏭️  Exists: {dst.name}"); 
+                continue
+            try: shutil.move(str(src), str(dst))
+            except Exception: shutil.copy2(str(src), str(dst))
+            say(f"• parked → {dst.relative_to(album_root)}")
     return 0
-"""
+'''
 
 # ================
 # Module bootstrap
