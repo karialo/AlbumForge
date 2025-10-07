@@ -504,7 +504,16 @@ except Exception:
     # Doctor will install these; we purposely import lazily in top-level script.
     InstalledAppFlow = Credentials = Request = build = MediaFileUpload = None
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+# Scopes:
+# - youtube            : full manage (needed for playlists create/insert)
+# - youtube.upload     : upload/manage videos (explicit upload permission)
+# - youtube.readonly   : read channel & playlist metadata (nice to have)
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
+# (If you prefer the single broad scope only, you can reduce to just 'youtube'.)
 
 def _profiles_base() -> Path:
     return Path.home() / ".config" / "AlbumForge" / "youtube" / "profiles"
@@ -524,22 +533,30 @@ def load_creds(profile:str="default"):
         creds = Credentials.from_authorized_user_file(str(tok), SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            # Refresh and persist the refreshed token so future runs don't re-auth
             creds.refresh(Request())
+            try:
+                tok.write_text(creds.to_json())
+            except Exception:
+                pass
         else:
             if not sec.exists():
-                raise FileNotFoundError(f"Missing {sec}. Download OAuth client (Desktop) JSON and place it there.")
+                raise FileNotFoundError(
+                    f"Missing {sec}. Download OAuth client (Desktop) JSON and place it there."
+                )
             flow = InstalledAppFlow.from_client_secrets_file(str(sec), SCOPES)
             try:
-                # Prefer local server (desktop); falls back to console mode via flag in caller
+                # Desktop-friendly local server flow (opens browser)
                 creds = flow.run_local_server(port=0, open_browser=True)
-            except Exception as e:
-                # Last-ditch: console flow
+            except Exception:
+                # Fallback: console flow
                 creds = flow.run_console()
-        tok.write_text(creds.to_json())
+            tok.write_text(creds.to_json())
     return creds
 
 def client(profile:str="default"):
     creds = load_creds(profile)
+    # static_discovery=False avoids fetching the big discovery doc
     return build("youtube", "v3", credentials=creds, static_discovery=False)
 
 def whoami(y, default="?"):
@@ -550,7 +567,7 @@ def whoami(y, default="?"):
     return f"{it['snippet']['title']} ({it['id']})"
 
 def ensure_playlist(y, title:str, privacy:str="public", desc:str="") -> str:
-    # Try to find existing
+    # Try to find existing playlist by exact title
     req = y.playlists().list(part="snippet", mine=True, maxResults=50)
     while True:
         resp = req.execute()
@@ -558,38 +575,49 @@ def ensure_playlist(y, title:str, privacy:str="public", desc:str="") -> str:
             if pl["snippet"]["title"] == title:
                 return pl["id"]
         tok = resp.get("nextPageToken")
-        if not tok: break
+        if not tok:
+            break
         req = y.playlists().list(part="snippet", mine=True, maxResults=50, pageToken=tok)
-    # Create
+    # Create if not found
     resp = y.playlists().insert(
         part="snippet,status",
-        body={"snippet":{"title":title,"description":desc},
-              "status":{"privacyStatus": privacy}}
+        body={
+            "snippet": {"title": title, "description": desc},
+            "status": {"privacyStatus": privacy},
+        },
     ).execute()
     return resp["id"]
 
 def upload_mp4(y, path:Path, *, title:str, desc:str="", tags:Optional[list[str]]=None, privacy:str="unlisted") -> str:
     media = MediaFileUpload(str(path), chunksize=-1, resumable=True, mimetype="video/mp4")
-    body = {"snippet":{"title":title,"description":desc,"tags":tags or []},
-            "status":{"privacyStatus":privacy}}
+    body = {
+        "snippet": {"title": title, "description": desc, "tags": tags or []},
+        "status": {"privacyStatus": privacy},
+    }
     req = y.videos().insert(part="snippet,status", body=body, media_body=media)
-    resp = None
+
+    # Resumable upload with simple exponential backoff
+    response = None
     backoff = 1.0
-    while resp is None:
+    while response is None:
         try:
-            status, resp = req.next_chunk()
+            status, response = req.next_chunk()
         except Exception:
-            time.sleep(backoff); backoff = min(backoff*2, 30.0)
-    return resp["id"]
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+    return response["id"]
 
 def add_to_playlist(y, playlist_id:str, video_id:str, position:int|None=None):
-    body = {"snippet":{"playlistId":playlist_id,
-                       "resourceId":{"kind":"youtube#video", "videoId":video_id}}}
+    body = {
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id},
+        }
+    }
     if position is not None:
         body["snippet"]["position"] = position
     y.playlistItems().insert(part="snippet", body=body).execute()
 """
-
 
 # ================
 # Module bootstrap
@@ -663,6 +691,85 @@ def say(x): print(x)
 def ok(x): print(f"\033[32m{x}\033[0m")
 def warn(x): print(f"\033[33m{x}\033[0m")
 def err(x): print(f"\033[31m{x}\033[0m", file=sys.stderr)
+
+# --- YouTube: upload whole album as a playlist --------------------------------
+def _album_render_dir(album_name: str) -> Path:
+    return MUSIC_ROOT / album_name / "_video"
+
+def _album_meta_file(album_name: str) -> Path:
+    return MUSIC_ROOT / album_name / ".albumforge.youtube.json"
+
+def youtube_upload_album(album_name: str, *, privacy: str = "unlisted", profile: str = "default") -> None:
+    """Upload all rendered MP4s for an album as a YouTube playlist.
+       Skips already-uploaded tracks using a small local map file."""
+    from pathlib import Path
+    import json
+
+    # lazy import from the embedded client
+    y = client(profile)
+    playlist_title = album_name
+    playlist_desc  = f"{album_name} — uploaded by AlbumForge"
+    playlist_id = ensure_playlist(y, playlist_title, privacy=privacy, desc=playlist_desc)
+
+    # state map (filename -> videoId)
+    meta_path = _album_meta_file(album_name)
+    state = {}
+    if meta_path.exists():
+        try:
+            state = json.loads(meta_path.read_text())
+        except Exception:
+            state = {}
+
+    # discover rendered videos
+    vdir = _album_render_dir(album_name)
+    if not vdir.exists():
+        say(f"No rendered videos found at: {vdir}")
+        say("Run: AlbumForge video --album \"{album_name}\" first.")
+        return
+
+    # keep stable order: 01.., 02.. etc.
+    files = sorted([p for p in vdir.glob("*.mp4") if p.is_file()], key=lambda p: p.name.lower())
+    if not files:
+        say(f"No .mp4 files in {vdir}")
+        return
+
+    ok(f"Uploading to: {whoami(y)}")
+    ok(f"PlayList ready: {playlist_title} (id: {playlist_id})")
+
+    uploaded = 0
+    added    = 0
+
+    for idx, path in enumerate(files, start=1):
+        title = path.stem
+        if path.name in state:
+            # Skip upload; ensure it's in the playlist (best-effort)
+            vid = state[path.name]
+            try:
+                add_to_playlist(y, playlist_id, vid, position=idx-1)
+            except Exception:
+                pass
+            say(f"Exists, skipping: {path.name}")
+            continue
+
+        # Upload
+        vid = upload_mp4(y, path, title=title, desc=f"{album_name} — {title}", tags=[album_name], privacy=privacy)
+        state[path.name] = vid
+        uploaded += 1
+        ok(f"Uploaded: {idx:02d}  →  {path.name}")
+
+        # Add to playlist in track order
+        add_to_playlist(y, playlist_id, vid, position=idx-1)
+        added += 1
+        ok(f"Uploaded & added: {idx:02d}  →  {path.name}")
+
+        # Persist mapping after each video (so resume is safe)
+        meta_path.write_text(json.dumps(state, indent=2))
+
+    if uploaded == 0:
+        ok("All tracks already uploaded; ensured playlist ordering.")
+    else:
+        ok(f"Album upload complete. New videos: {uploaded}, added to playlist: {added}")
+
 
 def _album_tracks(album_root: Path) -> list[tuple[str,str]]:
     state = load_state(album_root)
@@ -844,6 +951,23 @@ def manage_album_menu(cfg:dict):
         r = _safe_input(f"{prompt} ({d}): ").strip().lower()
         return (r in ("y","yes")) if r else default
 
+    # light wrapper: prefer internal helper if present; else shell out to CLI
+    def _youtube_upload_album(album_name:str, privacy:str="unlisted"):
+        try:
+            # If the project defines a python helper, use it
+            fn = globals().get("youtube_upload_album")
+            if callable(fn):
+                return fn(album_name, privacy=privacy)
+        except Exception:
+            pass
+        # Fallback: call the already-working CLI
+        try:
+            cmd = ["AlbumForge", "youtube", "upload", "--album", album_name, "--privacy", privacy]
+            return subprocess.call(cmd)
+        except Exception as e:
+            err(f"YouTube upload failed to start: {e}")
+            return 1
+
     album = ask("Album (blank to pick recent)") or None
     album_root = find_album_root(Path(cfg["music_root"]).expanduser(), album)
     ensure_album_tree(album_root)
@@ -858,14 +982,29 @@ def manage_album_menu(cfg:dict):
         pct = int(round(100 * min(a,l,r,v) / total))
         say(f"=== Manage: {album_root.name} ===  ({pct}%)")
         say(f"A:{a}  L:{l}  R:{r}  V:{v}")
-        say("\n1) Play album\n2) Show album cover\n3) Detect & set album cover\n4) Status\n5) Regenerate artwork\n6) Render videos\n7) Delete album (DANGEROUS)\nb) Back")
+        say(
+            "\n"
+            "1) Play album\n"
+            "2) Show album cover\n"
+            "3) Detect & set album cover\n"
+            "4) Status\n"
+            "5) Regenerate artwork\n"
+            "6) Render videos\n"
+            "7) Delete album (DANGEROUS)\n"
+            "8) Upload to YouTube\n"
+            "b) Back"
+        )
         choice = _safe_input("> ").strip().lower()
 
         if choice == "1":
             player = _pick_player()
-            if not player: err("No supported player (mpv/vlc/ffplay) found."); _safe_input("Enter…"); continue
+            if not player:
+                err("No supported player (mpv/vlc/ffplay) found.")
+                _safe_input("Enter…"); continue
             plist = sorted((album_root/"Audio").glob("*"))
-            if not plist: warn("No audio."); _safe_input("Enter…"); continue
+            if not plist:
+                warn("No audio.")
+                _safe_input("Enter…"); continue
             try:
                 subprocess.call(player + [str(p) for p in plist])
             except Exception as e:
@@ -887,7 +1026,8 @@ def manage_album_menu(cfg:dict):
         if choice == "3":
             src = ask("Source folder for cover detection", str(Path(cfg["downloads_dir"]).expanduser()))
             srcp = Path(src).expanduser()
-            if not srcp.exists(): err("No such folder."); _safe_input("Enter…"); continue
+            if not srcp.exists():
+                err("No such folder."); _safe_input("Enter…"); continue
             # derive tracks for better matching
             state = load_state(album_root)
             tracks = [(t["n"], t["title"]) for t in state.get("tracks", [])]
@@ -895,12 +1035,17 @@ def manage_album_menu(cfg:dict):
                 for p in sorted((album_root/"Audio").glob("*")):
                     m = re.match(r"^\s*(\d{2})\s*-\s*(.+)\.[^.]+$", p.name)
                     if m: tracks.append((m.group(1), m.group(2)))
-            best = detect_best_album_cover(srcp, album_root.name, tracks=tracks, lang=cfg.get("ocr_lang","eng"), psm=cfg.get("ocr_psm","6"))
+            best = detect_best_album_cover(
+                srcp, album_root.name, tracks=tracks,
+                lang=cfg.get("ocr_lang","eng"), psm=cfg.get("ocr_psm","6")
+            )
             if not best:
                 warn("No candidate images found."); _safe_input("Enter…"); continue
             say(f"Best candidate: {best.name}")
             if ask_yn("Use this as album cover?", True):
-                set_album_cover_from_image(album_root, best, ext=cfg.get("image_ext","png"), mode="copy")
+                set_album_cover_from_image(
+                    album_root, best, ext=cfg.get("image_ext","png"), mode="copy"
+                )
             _safe_input("Enter…"); continue
 
         if choice == "4":
@@ -911,7 +1056,10 @@ def manage_album_menu(cfg:dict):
             src = ask("Source folder for artwork", str(Path(cfg["downloads_dir"]).expanduser()))
             amode = ask("Artwork ingest mode (copy/move)", "copy").lower()
             amode = amode if amode in ("copy","move") else "copy"
-            action_art(cfg, argparse.Namespace(album=album_root.name, src=src, mode=amode, dry_run=False, force=False))
+            action_art(
+                cfg,
+                argparse.Namespace(album=album_root.name, src=src, mode=amode, dry_run=False, force=False)
+            )
             _safe_input("Enter…"); continue
 
         if choice == "6":
@@ -932,7 +1080,35 @@ def manage_album_menu(cfg:dict):
                 warn("Delete aborted.")
             _safe_input("Enter…"); continue
 
-        if choice in ("b","q","back"): 
+        if choice == "8":
+            # Upload to YouTube (creates/updates playlist with album name)
+            vids = sorted((album_root/"Video").glob("*.mp4"))
+            if not vids:
+                warn("No rendered videos found.")
+                if ask_yn("Render videos now?", True):
+                    action_video(cfg, argparse.Namespace(album=album_root.name, force=False))
+                    vids = sorted((album_root/"Video").glob("*.mp4"))
+                else:
+                    _safe_input("Enter…"); continue
+
+            if not vids:
+                err("Still no videos after render; aborting upload.")
+                _safe_input("Enter…"); continue
+
+            privacy = ask("YouTube privacy (public/unlisted/private)", "unlisted").strip().lower()
+            if privacy not in ("public","unlisted","private"):
+                warn("Invalid privacy; defaulting to 'unlisted'.")
+                privacy = "unlisted"
+
+            say(f"Uploading album '{album_root.name}' to YouTube as {privacy}…")
+            rc = _youtube_upload_album(album_root.name, privacy=privacy)
+            if rc not in (0, None):
+                err("YouTube upload reported an error.")
+            else:
+                ok("YouTube upload finished (check terminal output for playlist id / links).")
+            _safe_input("Enter…"); continue
+
+        if choice in ("b","q","back"):
             return
 
 
